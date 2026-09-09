@@ -82,6 +82,16 @@ gateway:
     default-token-limit: 100000
     period: 24h
 
+  cache:
+    enabled: true
+    # The most consequential number in this file. Too low and the gateway confidently
+    # answers a question nobody asked; too high and the cache never hits. A wrong answer
+    # costs far more than a missed cache, so this stays conservative.
+    similarity-threshold: 0.95
+    ttl: 1h
+    dimensions: 256
+    index-name: idx:completions
+
 resilience4j:
   circuitbreaker:
     configs:

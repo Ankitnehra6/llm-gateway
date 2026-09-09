@@ -83,6 +83,15 @@
 			<scope>runtime</scope>
 		</dependency>
 
+		<!-- Jedis alongside Spring Data Redis's Lettuce, solely for RediSearch.
+		     Vector KNN needs the FT.* command family, which Lettuce does not model
+		     and which is painful to drive through raw command execution. Two clients
+		     is a real cost; hand-rolling FT.SEARCH reply parsing is a worse one. -->
+		<dependency>
+			<groupId>redis.clients</groupId>
+			<artifactId>jedis</artifactId>
+		</dependency>
+
 		<!-- Circuit breaking, retry and bulkheads per provider. Deliberately a
 		     library rather than the hand-rolled breaker written for the Go
 		     gateway: the interesting work here is upstream failover policy,

@@ -32,4 +32,37 @@ public interface LlmProvider {
      *     retry against a different provider is worth attempting.
      */
     CompletionResult complete(CompletionRequest request);
+
+    /**
+     * Streams a completion, pushing partial text to {@code onChunk} as it arrives.
+     *
+     * <p>The default implementation calls {@link #complete} and emits the whole answer as
+     * a single chunk. That is not real streaming, but it means a provider without native
+     * streaming support still works through the streaming API instead of having to be
+     * special-cased at every call site. Providers that can stream should override it.
+     *
+     * @return the finished result, for token accounting and caching
+     */
+    default CompletionResult stream(CompletionRequest request, ChunkConsumer onChunk) {
+        CompletionResult result = complete(request);
+        try {
+            onChunk.accept(result.content());
+        } catch (Exception e) {
+            // The consumer failing means the client is gone. Surfaced as a provider
+            // failure so the router applies one policy to every way a stream can die.
+            throw ProviderException.upstream(name(), "stream consumer failed", e);
+        }
+        return result;
+    }
+
+    /**
+     * Receives streamed text.
+     *
+     * <p>Allowed to throw: the client disconnecting mid-stream is normal, and the provider
+     * needs to find out so it can stop generating rather than filling a dead socket.
+     */
+    @FunctionalInterface
+    interface ChunkConsumer {
+        void accept(String chunk) throws Exception;
+    }
 }

@@ -4,11 +4,13 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.header;
+import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.request;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
 import io.github.ankitnehra6.llmgateway.TestcontainersConfiguration;
 import io.github.ankitnehra6.llmgateway.budget.UsageRepository;
+import java.util.UUID;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.webmvc.test.autoconfigure.AutoConfigureMockMvc;
@@ -36,6 +38,15 @@ class ChatApiIntegrationTest {
     @Autowired private MockMvc mvc;
     @Autowired private UsageRepository usage;
 
+    /**
+     * Every test gets a unique prompt. The semantic cache is live in this suite and its
+     * state is shared across tests in the same context, so a fixed prompt would make one
+     * test's answer another test's cache hit and the assertions would depend on ordering.
+     */
+    private static String uniquePrompt(String label) {
+        return label + " " + UUID.randomUUID();
+    }
+
     private static String body(String prompt) {
         return """
                 {
@@ -52,7 +63,7 @@ class ChatApiIntegrationTest {
                         post("/v1/chat/completions")
                                 .header("Authorization", "Bearer " + PRO_KEY)
                                 .contentType(MediaType.APPLICATION_JSON)
-                                .content(body("hello gateway")))
+                                .content(body(uniquePrompt("hello gateway"))))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.content").isNotEmpty())
                 .andExpect(jsonPath("$.model").value("gpt-4o-mini"))
@@ -70,7 +81,7 @@ class ChatApiIntegrationTest {
                         post("/v1/chat/completions")
                                 .header("X-API-Key", PRO_KEY)
                                 .contentType(MediaType.APPLICATION_JSON)
-                                .content(body("via x-api-key")))
+                                .content(body(uniquePrompt("via x-api-key"))))
                 .andExpect(status().isOk());
     }
 
@@ -127,10 +138,134 @@ class ChatApiIntegrationTest {
                         post("/v1/chat/completions")
                                 .header("Authorization", "Bearer " + PRO_KEY)
                                 .contentType(MediaType.APPLICATION_JSON)
-                                .content(body("accounted for")))
+                                .content(body(uniquePrompt("accounted for"))))
                 .andExpect(status().isOk());
 
         assertThat(usage.count()).isEqualTo(before + 1);
+    }
+
+    /** The second identical request must be served from cache without touching upstream. */
+    @Test
+    void servesARepeatedPromptFromCache() throws Exception {
+        String prompt = uniquePrompt("what is the capital of France");
+
+        mvc.perform(
+                        post("/v1/chat/completions")
+                                .header("Authorization", "Bearer " + PRO_KEY)
+                                .contentType(MediaType.APPLICATION_JSON)
+                                .content(body(prompt)))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.gateway.cache_hit").value(false));
+
+        mvc.perform(
+                        post("/v1/chat/completions")
+                                .header("Authorization", "Bearer " + PRO_KEY)
+                                .contentType(MediaType.APPLICATION_JSON)
+                                .content(body(prompt)))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.gateway.cache_hit").value(true))
+                .andExpect(jsonPath("$.gateway.cache_similarity").value(org.hamcrest.Matchers.greaterThan(0.94)));
+    }
+
+    /**
+     * A cache hit costs no upstream tokens, so it must not be charged against the budget.
+     * Charging for it would penalise a tenant for the gateway working well.
+     */
+    @Test
+    void aCacheHitDoesNotConsumeBudget() throws Exception {
+        String prompt = uniquePrompt("does a cache hit cost anything");
+
+        mvc.perform(
+                post("/v1/chat/completions")
+                        .header("Authorization", "Bearer " + PRO_KEY)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body(prompt)));
+
+        long usedAfterFirst = usedTokens();
+
+        mvc.perform(
+                        post("/v1/chat/completions")
+                                .header("Authorization", "Bearer " + PRO_KEY)
+                                .contentType(MediaType.APPLICATION_JSON)
+                                .content(body(prompt)))
+                .andExpect(jsonPath("$.gateway.cache_hit").value(true));
+
+        assertThat(usedTokens())
+                .as("a cache hit must not increase billable usage")
+                .isEqualTo(usedAfterFirst);
+    }
+
+    private long usedTokens() throws Exception {
+        String json =
+                mvc.perform(get("/v1/usage").header("Authorization", "Bearer " + PRO_KEY))
+                        .andReturn()
+                        .getResponse()
+                        .getContentAsString();
+        return com.jayway.jsonpath.JsonPath.parse(json).read("$.used", Integer.class).longValue();
+    }
+
+    // --- streaming ---------------------------------------------------------------
+
+    @Test
+    void streamsWhenAskedTo() throws Exception {
+        String json =
+                """
+                {
+                  "model": "gpt-4o-mini",
+                  "stream": true,
+                  "messages": [{"role": "user", "content": "%s"}]
+                }
+                """
+                        .formatted(uniquePrompt("stream this back to me"));
+
+        var result =
+                mvc.perform(
+                                post("/v1/chat/completions")
+                                        .header("Authorization", "Bearer " + PRO_KEY)
+                                        .contentType(MediaType.APPLICATION_JSON)
+                                        .content(json))
+                        .andExpect(request().asyncStarted())
+                        .andReturn();
+
+        // An SseEmitter never "sets" an async result the way a Callable does — it writes
+        // to the response from another thread and then completes. asyncDispatch would
+        // wait forever, so poll the captured response until the stream ends instead.
+        String body = awaitStream(result);
+
+        // Shaped for OpenAI streaming clients: many delta chunks, then the sentinel.
+        assertThat(body).contains("chat.completion.chunk");
+        assertThat(body).contains("\"delta\"");
+        assertThat(body).endsWith("data:[DONE]\n\n");
+        assertThat(body.split("data:").length)
+                .as("a stream should arrive in several chunks, not one")
+                .isGreaterThan(3);
+    }
+
+    /** Waits for a streamed response to reach its terminating sentinel. */
+    private static String awaitStream(org.springframework.test.web.servlet.MvcResult result)
+            throws Exception {
+        long deadline = System.currentTimeMillis() + 10_000;
+        while (System.currentTimeMillis() < deadline) {
+            String body = result.getResponse().getContentAsString();
+            if (body.contains("[DONE]")) {
+                return body;
+            }
+            Thread.sleep(50);
+        }
+        throw new AssertionError(
+                "stream did not finish within 10s; got: " + result.getResponse().getContentAsString());
+    }
+
+    @Test
+    void rejectsAnUnauthenticatedStreamRequest() throws Exception {
+        mvc.perform(
+                        post("/v1/chat/completions")
+                                .contentType(MediaType.APPLICATION_JSON)
+                                .content(
+                                        """
+                                        {"stream":true,"messages":[{"role":"user","content":"hi"}]}
+                                        """))
+                .andExpect(status().isUnauthorized());
     }
 
     @Test
@@ -147,10 +282,13 @@ class ChatApiIntegrationTest {
      */
     @Test
     void stopsATenantThatRunsOutOfBudget() throws Exception {
-        String longPrompt = "x".repeat(4000); // ~1000 tokens per request
-
         int rejected = 0;
         for (int i = 0; i < 12; i++) {
+            // Each request must be a distinct prompt. Repeating one would hit the cache
+            // from the second request onward, and cache hits deliberately do not consume
+            // budget — so the tenant would never run out and this would test nothing.
+            String longPrompt = "budget probe " + i + " " + "x".repeat(4000);
+
             int status =
                     mvc.perform(
                                     post("/v1/chat/completions")

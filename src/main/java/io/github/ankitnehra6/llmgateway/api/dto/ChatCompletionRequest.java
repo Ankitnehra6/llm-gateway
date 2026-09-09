@@ -19,6 +19,8 @@ import java.util.List;
  * @param messages the conversation
  * @param maxTokens optional ceiling on the response
  * @param temperature optional sampling temperature
+ * @param stream when true the response is server-sent events rather than a single JSON
+ *     document, matching the same flag in the OpenAI API
  */
 public record ChatCompletionRequest(
         String model,
@@ -26,4 +28,11 @@ public record ChatCompletionRequest(
         @Min(value = 1, message = "max_tokens must be positive") Integer maxTokens,
         @DecimalMin(value = "0.0", message = "temperature must be between 0 and 2")
                 @DecimalMax(value = "2.0", message = "temperature must be between 0 and 2")
-                Double temperature) {}
+                Double temperature,
+        Boolean stream) {
+
+    /** Whether the caller asked for a streamed response. */
+    public boolean isStreaming() {
+        return Boolean.TRUE.equals(stream);
+    }
+}

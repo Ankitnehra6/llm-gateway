@@ -77,6 +77,33 @@ public class EchoProvider implements LlmProvider {
     }
 
     /**
+     * Emits the answer word by word, so the streaming path has something that actually
+     * arrives in pieces rather than one chunk pretending to be a stream.
+     */
+    @Override
+    public CompletionResult stream(CompletionRequest request, ChunkConsumer onChunk) {
+        CompletionResult result = complete(request);
+
+        String[] words = result.content().split(" ");
+        for (int i = 0; i < words.length; i++) {
+            String chunk = i == 0 ? words[i] : " " + words[i];
+            try {
+                onChunk.accept(chunk);
+                // A visible gap between tokens, so a demo shows text appearing rather
+                // than the whole answer landing at once.
+                Thread.sleep(Duration.ofMillis(25));
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw ProviderException.upstream(name, "interrupted mid-stream", e);
+            } catch (Exception e) {
+                // The client hung up. Stop generating rather than filling a dead socket.
+                throw ProviderException.upstream(name, "stream consumer failed", e);
+            }
+        }
+        return result;
+    }
+
+    /**
      * Produces a stable, obviously-synthetic answer. Deterministic for a given prompt, so
      * cache-hit assertions in tests are not at the mercy of a sampler.
      */

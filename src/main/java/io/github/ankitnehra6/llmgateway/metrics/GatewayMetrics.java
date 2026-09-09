@@ -49,6 +49,20 @@ public class GatewayMetrics {
         counter("llm_gateway_cache_total", "result", "miss", "model", model).increment();
     }
 
+    /**
+     * Tokens a cache hit avoided buying.
+     *
+     * <p>The number that decides whether the cache is worth its complexity. Without it the
+     * hit rate is a percentage with no denominator anyone cares about.
+     */
+    public void recordTokensSaved(String model, int tokens) {
+        Counter.builder("llm_gateway_tokens_saved_total")
+                .description("Tokens not purchased upstream because a cached answer was served")
+                .tag("model", model)
+                .register(registry)
+                .increment(tokens);
+    }
+
     /** A provider failed and the router moved on to the next one. */
     public void recordFailover(String fromProvider) {
         counter("llm_gateway_failovers_total", "from", fromProvider).increment();

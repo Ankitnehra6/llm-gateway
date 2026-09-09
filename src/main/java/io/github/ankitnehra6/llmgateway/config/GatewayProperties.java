@@ -15,7 +15,27 @@ import org.springframework.boot.context.properties.bind.DefaultValue;
 public record GatewayProperties(
         @DefaultValue List<ProviderConfig> providers,
         @DefaultValue("gpt-4o-mini") String defaultModel,
-        @DefaultValue Budget budget) {
+        @DefaultValue Budget budget,
+        @DefaultValue Cache cache) {
+
+    /**
+     * Semantic cache settings.
+     *
+     * @param enabled whether to look up and store answers at all
+     * @param similarityThreshold minimum cosine similarity to count as a hit. The single
+     *     most consequential number here: too low and the gateway confidently answers a
+     *     question nobody asked, too high and the cache never hits. 0.95 is deliberately
+     *     conservative — a wrong answer costs far more than a missed cache.
+     * @param ttl how long an entry survives, bounding both memory and staleness
+     * @param dimensions embedding width; changing it requires rebuilding the index
+     * @param indexName RediSearch index to create and query
+     */
+    public record Cache(
+            @DefaultValue("true") boolean enabled,
+            @DefaultValue("0.95") double similarityThreshold,
+            @DefaultValue("1h") Duration ttl,
+            @DefaultValue("256") int dimensions,
+            @DefaultValue("idx:completions") String indexName) {}
 
     /**
      * One upstream in the failover chain.

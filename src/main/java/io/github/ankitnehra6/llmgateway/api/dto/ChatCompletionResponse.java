@@ -30,13 +30,17 @@ public record ChatCompletionResponse(
      * @param failedOver whether the first-choice provider was bypassed
      * @param attempts each provider tried, in order, with its outcome
      * @param budgetRemaining tokens left in the tenant's period
+     * @param cacheSimilarity cosine similarity to the cached prompt, null on a miss.
+     *     Exposed so a hit can be judged rather than trusted — a client that finds
+     *     0.96-similarity answers unacceptable can see that and say so.
      */
     public record GatewayInfo(
             String provider,
             boolean cacheHit,
             boolean failedOver,
             List<AttemptDto> attempts,
-            long budgetRemaining) {}
+            long budgetRemaining,
+            Double cacheSimilarity) {}
 
     /**
      * @param provider the upstream tried

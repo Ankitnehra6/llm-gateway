@@ -4,6 +4,8 @@ import io.github.ankitnehra6.llmgateway.api.dto.ChatCompletionRequest;
 import io.github.ankitnehra6.llmgateway.api.dto.ChatCompletionResponse;
 import io.github.ankitnehra6.llmgateway.api.dto.MessageDto;
 import io.github.ankitnehra6.llmgateway.budget.BudgetService;
+import io.github.ankitnehra6.llmgateway.cache.CachedCompletion;
+import io.github.ankitnehra6.llmgateway.cache.SemanticCache;
 import io.github.ankitnehra6.llmgateway.budget.UsageRecord;
 import io.github.ankitnehra6.llmgateway.config.GatewayProperties;
 import io.github.ankitnehra6.llmgateway.metrics.GatewayMetrics;
@@ -18,6 +20,7 @@ import io.github.ankitnehra6.llmgateway.tenant.Tenant;
 import java.time.Duration;
 import java.util.List;
 import java.util.Locale;
+import java.util.Optional;
 import java.util.UUID;
 import org.springframework.stereotype.Service;
 
@@ -32,29 +35,42 @@ public class ChatService {
 
     private final ProviderRouter router;
     private final BudgetService budgets;
+    private final SemanticCache cache;
     private final GatewayMetrics metrics;
     private final GatewayProperties properties;
 
     public ChatService(
             ProviderRouter router,
             BudgetService budgets,
+            SemanticCache cache,
             GatewayMetrics metrics,
             GatewayProperties properties) {
         this.router = router;
         this.budgets = budgets;
+        this.cache = cache;
         this.metrics = metrics;
         this.properties = properties;
     }
 
     public ChatCompletionResponse complete(Tenant tenant, ChatCompletionRequest request) {
-        // Checked before routing: refusing a request that cannot be paid for is far
-        // cheaper than discovering it after an upstream has already billed for it.
-        BudgetService.BudgetStatus budget = budgets.checkAffordable(tenant);
-
         String model = resolveModel(request.model());
         CompletionRequest completionRequest =
                 new CompletionRequest(
                         model, toDomain(request.messages()), request.maxTokens(), request.temperature());
+
+        // The cache is consulted before the budget, and a hit is served even to a tenant
+        // that is over its limit. A budget caps *spend*, and a cache hit spends nothing
+        // upstream; refusing one would penalise a tenant for the gateway working well.
+        // Bounding the request rate itself is a rate limiter's job, not a budget's.
+        Optional<CachedCompletion> cached = cache.lookup(completionRequest);
+        if (cached.isPresent()) {
+            return serveFromCache(tenant, model, cached.get());
+        }
+        metrics.recordCacheMiss(model);
+
+        // Checked before routing: refusing a request that cannot be paid for is far
+        // cheaper than discovering it after an upstream has already billed for it.
+        BudgetService.BudgetStatus budget = budgets.checkAffordable(tenant);
 
         long startedAt = System.nanoTime();
         RoutedCompletion routed;
@@ -89,6 +105,11 @@ public class ChatService {
             }
         }
 
+        // Stored after the response is assembled, and never in a way that can fail the
+        // request: the caller already has a correct answer, and losing a cache write only
+        // costs the next caller a miss.
+        cache.store(completionRequest, result);
+
         long remaining = Math.max(0, budget.remaining() - result.totalTokens());
 
         return new ChatCompletionResponse(
@@ -102,7 +123,51 @@ public class ChatService {
                         false,
                         routed.failedOver(),
                         toAttemptDtos(routed.attempts()),
-                        remaining));
+                        remaining,
+                        null));
+    }
+
+    /**
+     * Builds a response from a cache hit.
+     *
+     * <p>The ledger row records the tokens the upstream <em>would</em> have charged, marked
+     * as a cache hit. Recording zero would be simpler and would lose the only number that
+     * proves the cache is worth running: budget sums already exclude cache hits, so the
+     * tokens here are counted as saved rather than spent.
+     */
+    private ChatCompletionResponse serveFromCache(
+            Tenant tenant, String model, CachedCompletion cached) {
+
+        metrics.recordCacheHit(model);
+        metrics.recordTokensSaved(model, cached.promptTokens() + cached.completionTokens());
+
+        budgets.record(
+                new UsageRecord(
+                        tenant.id(),
+                        cached.provider(),
+                        cached.model(),
+                        cached.promptTokens(),
+                        cached.completionTokens(),
+                        true,
+                        0));
+
+        BudgetService.BudgetStatus budget = budgets.status(tenant);
+
+        return new ChatCompletionResponse(
+                "chatcmpl-" + UUID.randomUUID(),
+                cached.model(),
+                cached.content(),
+                new ChatCompletionResponse.UsageDto(
+                        cached.promptTokens(),
+                        cached.completionTokens(),
+                        cached.promptTokens() + cached.completionTokens()),
+                new ChatCompletionResponse.GatewayInfo(
+                        cached.provider(),
+                        true,
+                        false,
+                        List.of(),
+                        budget.remaining(),
+                        cached.similarity()));
     }
 
     private String resolveModel(String requested) {

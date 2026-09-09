@@ -5,19 +5,18 @@
 [![Spring Boot](https://img.shields.io/badge/spring%20boot-4.1-6DB33F?logo=springboot&logoColor=white)](https://spring.io/projects/spring-boot)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-A gateway that sits between your application and LLM providers: multi-provider failover
-with per-upstream circuit breaking, per-tenant token budgets backed by an append-only
-ledger, and an OpenAI-compatible API so existing clients need only a new base URL.
+A gateway that sits between your application and LLM providers: semantic caching on Redis
+vector search, multi-provider failover with per-upstream circuit breaking, per-tenant token
+budgets backed by an append-only ledger, SSE streaming, and an OpenAI-compatible API so
+existing clients need only a new base URL.
 
 **The problem it solves.** Calling a model provider directly means your availability is
 theirs, your spend is unbounded until the invoice arrives, and switching vendors is a
 code change. A gateway makes failover a configuration line, spend a hard limit that is
 enforced before the request is made, and the provider an implementation detail.
 
-> **Status:** the routing, budgeting and accounting core is complete and tested. Semantic
-> caching and SSE streaming are the next increments — see [Roadmap](#roadmap). The
-> `cache_hit` field is already on the wire and always `false` today; it is not yet
-> implemented, and this README does not claim otherwise.
+On a workload of 200 requests drawn from 20 distinct prompts, the semantic cache served
+**90% of them**, saved **5,056 tokens**, and answered **10.9× faster** than a miss.
 
 ---
 
@@ -42,26 +41,30 @@ flowchart TD
 
     subgraph Gateway["LLM Gateway"]
         Auth["Tenant resolver<br/>API key → SHA-256 → tenant"]
+        Cache{"Semantic cache<br/>cosine ≥ 0.95?"}
         Budget{"Within budget?"}
-        Router["Provider router<br/>failover chain"]
+        Router["Provider router<br/>retry, then failover"]
         CB1{"Circuit:<br/>primary"}
         CB2{"Circuit:<br/>secondary"}
         Ledger["Usage ledger"]
 
-        Auth --> Budget
+        Auth --> Cache
+        Cache -->|"miss"| Budget
         Budget -->|"yes"| Router
         Router --> CB1
         CB1 -->|"open — skipped"| CB2
         CB1 -->|"failed, retryable"| CB2
     end
 
+    Cache <-->|"KNN vector search"| Redis[("Redis Stack")]
+    Cache -->|"hit — no upstream call"| Response
     Budget -->|"no"| Rejected["429 + X-Budget-Remaining"]
     CB1 -->|"closed"| P1["Provider A"]
     CB2 -->|"closed"| P2["Provider B"]
     P1 --> Ledger
     P2 --> Ledger
     Ledger --> Postgres[("Postgres<br/>tenants + usage")]
-    Ledger --> Response["200 + usage + route taken"]
+    Ledger --> Response["200 JSON, or an SSE stream"]
     Gateway -.->|"scraped"| Metrics["/actuator/prometheus"]
 ```
 
@@ -70,12 +73,12 @@ flowchart TD
 ## Quickstart
 
 Runs with **no API key and no network access**. Both configured providers are a local
-deterministic stand-in, because everything worth demonstrating here — failover, circuit
-breaking, budget enforcement, accounting — is about the gateway, not about the quality of
-an upstream's prose.
+deterministic stand-in, because everything worth demonstrating here — caching, failover,
+circuit breaking, budget enforcement, accounting — is about the gateway, not about the
+quality of an upstream's prose.
 
 ```bash
-make up      # gateway, Postgres, Redis, Prometheus
+make up      # gateway, Postgres, Redis Stack, Prometheus
 make smoke   # sends real requests and shows what came back
 make down
 ```
@@ -123,8 +126,22 @@ route the request actually took is right there in the response rather than only 
 
 ## What it does
 
+**Semantic caching.** Each answer is stored with its prompt's embedding and indexed by
+RediSearch. A lookup runs a vector KNN query and serves the nearest prior answer when the
+cosine similarity clears a threshold, so "How do I reverse a list in Java" and "how do i
+reverse a list in java?" cost one upstream call between them.
+
+**Streaming.** `"stream": true` switches the response to server-sent events in the OpenAI
+chunk format. Cache hits are replayed as a stream too, so a client cannot tell a cached
+answer from a generated one by its shape.
+
 **Multi-provider failover.** Providers are tried in configuration order. The first that
 supports the requested model and whose circuit is closed serves the request.
+
+**Retry, then failover.** A transient blip is retried against the same provider with
+exponential backoff and jitter; a provider that is actually down is abandoned. Doing only
+failover means one flaky response permanently demotes a healthy provider; doing only retry
+means a dead one gets hammered instead of skipped.
 
 **Per-upstream circuit breaking.** Each provider gets its own Resilience4j breaker, so a
 failing upstream is skipped outright instead of costing every request a timeout before
@@ -148,6 +165,47 @@ latency, cache outcome.
 
 Not descriptions — these are outputs from the running stack, reproducible with
 `make up && make smoke`.
+
+### Semantic cache
+
+200 requests drawn from 20 distinct prompts with a Zipf-like popularity skew, 30% of them
+reworded to differ in case and punctuation:
+
+| Metric | Result |
+|---|---|
+| Cache hits | **180 / 200 (90.0%)** |
+| Tokens saved | **5,056** |
+| p50 latency, cache hit | **4.50 ms** |
+| p50 latency, cache miss | 49.08 ms |
+| Speedup on a hit | **10.9×** |
+
+Behaviour on specific prompts:
+
+```
+cold ask       cache_hit=False provider=primary
+same again     cache_hit=True  similarity=1.0000
+reworded       cache_hit=True  similarity=1.0000    ("what is the capital of france?")
+different      cache_hit=False provider=primary     ("...capital of Japan")
+```
+
+A one-word change is **not** a hit at the default threshold: "reverse a list in Java" and
+"reverse a list in Python" want different answers, and a cache confident enough to
+conflate them is worse than no cache.
+
+### Streaming
+
+```
+chunks received   10
+time to first     49 ms
+total            330 ms
+```
+
+Wire format, unmodified from the running gateway:
+
+```
+data:{"id":"chatcmpl-645d...","object":"chat.completion.chunk","model":"gpt-4o-mini",
+      "choices":[{"index":0,"delta":{"content":"[primary]"}}]}
+```
 
 ### Failover and circuit breaking
 
@@ -193,6 +251,31 @@ RFC 9457 problem document.
 
 ## Design decisions
 
+**A cache hit does not consume budget.** A budget caps *spend*, and a hit spends nothing
+upstream. Charging for one would penalise a tenant for the gateway working well. Bounding
+the request rate itself is a rate limiter's job, not a budget's. The ledger still records
+what the hit *would* have cost, marked `cache_hit`, which is where the tokens-saved number
+comes from.
+
+**The similarity threshold is deliberately conservative.** 0.95, not 0.85. A wrong answer
+costs far more than a missed cache, and the failure mode of a loose threshold is the
+gateway confidently answering a question nobody asked.
+
+**Vector search in Redis, not cosine in the JVM.** The candidate set is every prompt the
+gateway has ever answered. Pulling that into the application to score it would turn a
+cache lookup into a full scan — the cache would get slower exactly as it became more
+useful.
+
+**Cache entries are namespaced by requested model *and* embedding model.** Serving a GPT
+answer to a Claude request would be wrong, and vectors from different embedding models are
+not comparable. Changing the embedding model must invalidate the cache rather than
+silently return nonsense.
+
+**Streaming cannot fail over once it has started.** Bytes already on the client's socket
+cannot be unsent, so switching providers mid-stream would splice two different answers into
+one response. A failure after the first chunk aborts instead. This is why streaming and
+buffered requests do not share a code path — the failover window closes partway through.
+
 **Budgets are checked, not reserved.** Holding a reservation across an upstream call
 would need a two-phase commit against a provider that has no notion of one, and the
 failure mode — a crashed gateway leaving phantom reservations that lock a tenant out — is
@@ -231,7 +314,7 @@ All configuration is environment variables or `application.yml`.
 |---|---|---|
 | `DATABASE_URL` | `jdbc:postgresql://localhost:5432/llmgateway` | Postgres JDBC URL |
 | `DATABASE_USER` / `DATABASE_PASSWORD` | `llmgateway` | Credentials |
-| `REDIS_HOST` / `REDIS_PORT` | `localhost` / `6379` | Redis, for the coming cache |
+| `REDIS_HOST` / `REDIS_PORT` | `localhost` / `6379` | Redis Stack, for the semantic cache |
 | `SERVER_PORT` | `8080` | Listen port |
 
 Providers are a list, in failover order:
@@ -251,7 +334,16 @@ gateway:
     enabled: true
     default-token-limit: 100000
     period: 24h
+  cache:
+    enabled: true
+    similarity-threshold: 0.95   # the most consequential number here
+    ttl: 1h
+    dimensions: 256
 ```
+
+The cache needs **Redis Stack**, not plain Redis — vector KNN lives in RediSearch. Against
+a plain Redis the gateway still starts, logs that caching is unavailable, and serves every
+request from upstream.
 
 Circuit breaker behaviour is standard Resilience4j configuration under
 `resilience4j.circuitbreaker`, keyed by provider name.
@@ -265,7 +357,7 @@ make test     # unit + integration, real Postgres and Redis via Testcontainers
 make verify   # full build
 ```
 
-18 tests, no mocked infrastructure. The integration suite runs the actual Flyway
+46 tests, no mocked infrastructure. The integration suite runs the actual Flyway
 migrations against a real Postgres, so the entity mappings and the schema are verified
 against each other rather than assumed to agree.
 
@@ -274,8 +366,12 @@ Worth reading:
 - **`ProviderRouterTest`** — failover, circuit opening, and the case that matters most:
   a non-retryable error must *not* fail over, asserted by proving the second provider was
   never called.
-- **`ChatApiIntegrationTest`** — auth, validation, budget exhaustion and the guarantee
-  that every served request leaves a ledger row.
+- **`ChatApiIntegrationTest`** — auth, validation, budget exhaustion, streaming, and the
+  guarantee that every served request leaves a ledger row. Also that a cache hit does not
+  consume budget.
+- **`RedisSemanticCacheTest`** — vector KNN against a real Redis Stack, including that the
+  threshold is what decides a hit (same prompt pair, two thresholds, opposite outcomes)
+  and that an unreachable Redis degrades to a miss instead of an error.
 
 ### If `make test` cannot find Docker
 
@@ -292,21 +388,26 @@ Built:
 
 - [x] Provider abstraction with an ordered failover chain
 - [x] Per-provider circuit breaking
+- [x] Retry with exponential backoff and jitter, before failover
 - [x] Retryable vs terminal failure classification
+- [x] **Semantic caching** on Redis vector search, with measured hit rate and savings
+- [x] **SSE streaming**, including replay of cache hits as a stream
 - [x] Per-tenant budgets with an append-only usage ledger
 - [x] OpenAI-compatible request/response shape
 - [x] RFC 9457 problem details
-- [x] Prometheus metrics
-- [x] Integration tests on real Postgres and Redis
+- [x] Prometheus metrics, including tokens saved by the cache
+- [x] 46 tests, integration suite on real Postgres and Redis Stack
 
-Next:
+Not built, and deliberately so:
 
-- [ ] **Semantic caching in Redis** — embed the prompt, serve on cosine similarity hit.
-      The headline feature, and the one worth publishing hit-rate numbers for.
-- [ ] **SSE streaming passthrough** — must not break when a provider stalls mid-stream
-- [ ] **A real provider adapter** (Anthropic), behind the same interface
+- [ ] **A real vendor adapter.** The `LlmProvider` interface exists for exactly this and
+      the echo provider proves the seam works, but a hosted adapter cannot be honestly
+      tested here without a paid key, and an untested adapter is worse than none.
+- [ ] **A real embedding model.** `HashingEmbeddingModel` measures *lexical* similarity,
+      not semantic — it will not match "reverse a list" to "invert an array".
+      `EmbeddingModel` is the seam to swap in a hosted model.
 - [ ] Prompt versioning and A/B routing
-- [ ] Cost dashboard, with dollars saved by the cache
+- [ ] Grafana dashboard (Prometheus is wired and scraping; only the JSON is missing)
 
 ---
 

@@ -24,11 +24,13 @@ services:
     volumes:
       - postgres-data:/var/lib/postgresql/data
 
+  # Redis Stack, not plain Redis: the semantic cache uses RediSearch vector KNN,
+  # which the base image does not ship. With plain Redis the gateway still runs, it
+  # just logs that caching is unavailable and serves every request from upstream.
   redis:
-    image: redis:7-alpine
+    image: redis/redis-stack-server:7.4.0-v3
     ports:
       - "${REDIS_PORT:-6379}:6379"
-    command: ["redis-server", "--save", "", "--appendonly", "no"]
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 3s

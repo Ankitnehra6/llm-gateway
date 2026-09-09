@@ -13,6 +13,7 @@ import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
+import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 
 /** The public API. Shaped for drop-in compatibility with OpenAI chat completion clients. */
 @RestController
@@ -20,20 +21,39 @@ import org.springframework.web.bind.annotation.RestController;
 public class ChatController {
 
     private final ChatService chat;
+    private final ChatStreamService streams;
     private final TenantResolver tenants;
     private final BudgetService budgets;
 
-    public ChatController(ChatService chat, TenantResolver tenants, BudgetService budgets) {
+    public ChatController(
+            ChatService chat,
+            ChatStreamService streams,
+            TenantResolver tenants,
+            BudgetService budgets) {
         this.chat = chat;
+        this.streams = streams;
         this.tenants = tenants;
         this.budgets = budgets;
     }
 
+    /**
+     * Serves a completion, buffered or streamed.
+     *
+     * <p>One endpoint switching on the {@code stream} flag rather than two paths, because
+     * that is how the OpenAI API behaves and compatibility is the point. The return type
+     * is {@code Object} so the same method can hand back either a JSON body or an
+     * {@link SseEmitter}; Spring dispatches on the runtime type.
+     */
     @PostMapping("/chat/completions")
-    public ResponseEntity<ChatCompletionResponse> completions(
+    public Object completions(
             HttpServletRequest http, @Valid @RequestBody ChatCompletionRequest request) {
 
         Tenant tenant = authenticate(http);
+
+        if (request.isStreaming()) {
+            return streams.stream(tenant, request);
+        }
+
         ChatCompletionResponse response = chat.complete(tenant, request);
 
         // Advertised on every response so a well-behaved client can slow down before it

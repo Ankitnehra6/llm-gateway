@@ -1,0 +1,81 @@
+# Full local stack: the gateway, Postgres, Redis and Prometheus.
+#
+#   docker compose -f deploy/docker-compose.yml up --build
+#
+# Every published port is overridable, because 8080 and 5432 are commonly already in
+# use. Copy deploy/.env.example to deploy/.env and change them there.
+
+name: llm-gateway
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    environment:
+      POSTGRES_DB: llmgateway
+      POSTGRES_USER: llmgateway
+      POSTGRES_PASSWORD: llmgateway
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U llmgateway -d llmgateway"]
+      interval: 3s
+      timeout: 3s
+      retries: 15
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+
+  gateway:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    ports:
+      - "${GATEWAY_PORT:-8080}:8080"
+    environment:
+      DATABASE_URL: jdbc:postgresql://postgres:5432/llmgateway
+      DATABASE_USER: llmgateway
+      DATABASE_PASSWORD: llmgateway
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      # Both providers are the local echo stand-in, so the stack runs with no API key
+      # and no network. The secondary is slower, which makes a failover visible in the
+      # latency numbers rather than only in the logs.
+      GATEWAY_PROVIDERS_0_NAME: primary
+      GATEWAY_PROVIDERS_0_TYPE: echo
+      GATEWAY_PROVIDERS_0_LATENCY: 40ms
+      GATEWAY_PROVIDERS_1_NAME: secondary
+      GATEWAY_PROVIDERS_1_TYPE: echo
+      GATEWAY_PROVIDERS_1_LATENCY: 150ms
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8080/actuator/health || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 30s
+
+  prometheus:
+    image: prom/prometheus:v3.1.0
+    ports:
+      - "${PROMETHEUS_PORT:-9091}:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    depends_on:
+      - gateway
+
+volumes:
+  postgres-data:

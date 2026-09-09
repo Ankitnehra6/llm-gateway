@@ -1,0 +1,105 @@
+spring:
+  application:
+    name: llm-gateway
+
+  # Virtual threads: a request here spends nearly all its time blocked on an upstream
+  # HTTP call, which is precisely the workload platform threads waste memory on.
+  threads:
+    virtual:
+      enabled: true
+
+  jackson:
+    # Matches the OpenAI wire format, so existing clients work by changing only a base
+    # URL. Internally the domain stays camelCase.
+    property-naming-strategy: SNAKE_CASE
+    default-property-inclusion: non_null
+
+  datasource:
+    url: ${DATABASE_URL:jdbc:postgresql://localhost:5432/llmgateway}
+    username: ${DATABASE_USER:llmgateway}
+    password: ${DATABASE_PASSWORD:llmgateway}
+    hikari:
+      maximum-pool-size: 20
+
+  jpa:
+    # Flyway owns the schema. Letting Hibernate near DDL invites silent drift between
+    # what the migrations say and what the entities assume.
+    hibernate:
+      ddl-auto: validate
+    open-in-view: false
+    properties:
+      hibernate:
+        jdbc:
+          time_zone: UTC
+
+  flyway:
+    enabled: true
+    locations: classpath:db/migration
+
+  data:
+    redis:
+      host: ${REDIS_HOST:localhost}
+      port: ${REDIS_PORT:6379}
+      timeout: 2s
+
+server:
+  port: ${SERVER_PORT:8080}
+  shutdown: graceful
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,prometheus,metrics
+  endpoint:
+    health:
+      show-details: when-authorized
+  metrics:
+    tags:
+      application: llm-gateway
+
+gateway:
+  default-model: gpt-4o-mini
+
+  # Failover order. The first provider that supports the model and whose circuit is
+  # closed serves the request.
+  #
+  # Both entries are the local echo provider so the gateway runs with no API key and no
+  # network at all. The secondary is slower, which makes a failover visible in the
+  # latency numbers rather than only in the logs.
+  providers:
+    - name: primary
+      type: echo
+      latency: 40ms
+      failure-rate: 0.0
+    - name: secondary
+      type: echo
+      latency: 150ms
+      failure-rate: 0.0
+
+  budget:
+    enabled: true
+    default-token-limit: 100000
+    period: 24h
+
+resilience4j:
+  circuitbreaker:
+    configs:
+      default:
+        slidingWindowType: COUNT_BASED
+        slidingWindowSize: 20
+        minimumNumberOfCalls: 5
+        failureRateThreshold: 50
+        waitDurationInOpenState: 10s
+        permittedNumberOfCallsInHalfOpenState: 3
+        automaticTransitionFromOpenToHalfOpenEnabled: true
+        registerHealthIndicator: true
+    instances:
+      primary:
+        baseConfig: default
+      secondary:
+        baseConfig: default
+
+logging:
+  level:
+    io.github.ankitnehra6.llmgateway: INFO

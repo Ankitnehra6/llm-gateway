@@ -24,6 +24,17 @@ FROM eclipse-temurin:25-jre
 
 WORKDIR /app
 
+# curl is needed by the container healthcheck and is not in the JRE image. Without it
+# the healthcheck fails with "curl: not found" on every probe, so the container is
+# reported unhealthy forever while serving traffic perfectly well — and an orchestrator
+# using that signal would never route to it.
+#
+# Installed in the runtime stage rather than assumed: the alternative is a healthcheck
+# that cannot actually check anything.
+RUN apt-get update \
+    && apt-get install --yes --no-install-recommends curl \
+    && rm -rf /var/lib/apt/lists/*
+
 # Runs as an unprivileged user. The base image does not provide one, so it is created
 # here rather than defaulting to root.
 RUN groupadd --system --gid 1001 spring \

@@ -15,20 +15,42 @@ import java.util.List;
  * @param choices exactly one, since this gateway does not fan out to n completions
  */
 public record ChatCompletionChunk(
-        String id, String object, String model, List<Choice> choices) {
+        String id,
+        String object,
+        String model,
+        List<Choice> choices,
+        ChatCompletionResponse.GatewayInfo gateway) {
 
     public static ChatCompletionChunk content(String id, String model, String text) {
-        return new ChatCompletionChunk(
-                id, "chat.completion.chunk", model, List.of(new Choice(0, new Delta(text), null)));
-    }
-
-    /** The terminating chunk: an empty delta plus a reason the generation stopped. */
-    public static ChatCompletionChunk done(String id, String model, String finishReason) {
         return new ChatCompletionChunk(
                 id,
                 "chat.completion.chunk",
                 model,
-                List.of(new Choice(0, new Delta(null), finishReason)));
+                List.of(new Choice(0, new Delta(text), null)),
+                null);
+    }
+
+    /**
+     * The terminating chunk: an empty delta, a reason the generation stopped, and the
+     * gateway's own account of what happened.
+     *
+     * <p>The gateway block rides on the last chunk rather than the first because it is
+     * only fully known once the response is complete. Attaching it at all is what lets a
+     * streaming client tell a cache hit from an upstream call — without it, every stream
+     * looks identical from the outside. Clients that only understand the vendor schema
+     * ignore the extra field.
+     */
+    public static ChatCompletionChunk done(
+            String id,
+            String model,
+            String finishReason,
+            ChatCompletionResponse.GatewayInfo gateway) {
+        return new ChatCompletionChunk(
+                id,
+                "chat.completion.chunk",
+                model,
+                List.of(new Choice(0, new Delta(null), finishReason)),
+                gateway);
     }
 
     /**

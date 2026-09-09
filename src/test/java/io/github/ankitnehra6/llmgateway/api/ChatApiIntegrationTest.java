@@ -3,6 +3,7 @@ package io.github.ankitnehra6.llmgateway.api;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
+import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.content;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.header;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.request;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
@@ -254,6 +255,80 @@ class ChatApiIntegrationTest {
         }
         throw new AssertionError(
                 "stream did not finish within 10s; got: " + result.getResponse().getContentAsString());
+    }
+
+    /**
+     * Without gateway metadata on the terminating chunk, a streamed cache hit is
+     * indistinguishable from a streamed upstream call — the console would label every
+     * stream "upstream" and quietly lie about it.
+     */
+    @Test
+    void aStreamedCacheHitSaysSo() throws Exception {
+        String prompt = uniquePrompt("stream me from cache");
+        String json =
+                """
+                {"model":"gpt-4o-mini","stream":true,"messages":[{"role":"user","content":"%s"}]}
+                """
+                        .formatted(prompt);
+
+        var first =
+                mvc.perform(
+                                post("/v1/chat/completions")
+                                        .header("Authorization", "Bearer " + PRO_KEY)
+                                        .contentType(MediaType.APPLICATION_JSON)
+                                        .content(json))
+                        .andReturn();
+        assertThat(awaitStream(first)).contains("\"cache_hit\":false");
+
+        var second =
+                mvc.perform(
+                                post("/v1/chat/completions")
+                                        .header("Authorization", "Bearer " + PRO_KEY)
+                                        .contentType(MediaType.APPLICATION_JSON)
+                                        .content(json))
+                        .andReturn();
+
+        String body = awaitStream(second);
+        assertThat(body).contains("\"cache_hit\":true");
+        assertThat(body).contains("\"cache_similarity\"");
+    }
+
+    // --- console stats ------------------------------------------------------------
+
+    @Test
+    void reportsGatewayStatsForTheConsole() throws Exception {
+        mvc.perform(
+                post("/v1/chat/completions")
+                        .header("Authorization", "Bearer " + PRO_KEY)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body(uniquePrompt("populate the stats"))));
+
+        mvc.perform(get("/v1/gateway/stats").header("Authorization", "Bearer " + PRO_KEY))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.cache.enabled").value(true))
+                .andExpect(jsonPath("$.cache.similarity_threshold").value(0.95))
+                .andExpect(jsonPath("$.cache.misses").value(org.hamcrest.Matchers.greaterThan(0)))
+                // Both configured providers, in failover order.
+                .andExpect(jsonPath("$.providers.length()").value(2))
+                .andExpect(jsonPath("$.providers[0].name").value("primary"))
+                .andExpect(jsonPath("$.providers[0].circuit_state").value("closed"))
+                .andExpect(jsonPath("$.tenant.id").value("demo-pro"))
+                .andExpect(jsonPath("$.default_model").value("gpt-4o-mini"));
+    }
+
+    /** Operational state is not something an anonymous caller should be able to read. */
+    @Test
+    void statsRequireAValidKey() throws Exception {
+        mvc.perform(get("/v1/gateway/stats")).andExpect(status().isUnauthorized());
+        mvc.perform(get("/v1/gateway/stats").header("Authorization", "Bearer nope"))
+                .andExpect(status().isUnauthorized());
+    }
+
+    @Test
+    void servesTheConsole() throws Exception {
+        mvc.perform(get("/index.html"))
+                .andExpect(status().isOk())
+                .andExpect(content().string(org.hamcrest.Matchers.containsString("LLM Gateway")));
     }
 
     @Test

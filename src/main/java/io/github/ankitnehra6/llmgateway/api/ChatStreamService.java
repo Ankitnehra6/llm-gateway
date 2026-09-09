@@ -2,6 +2,7 @@ package io.github.ankitnehra6.llmgateway.api;
 
 import io.github.ankitnehra6.llmgateway.api.dto.ChatCompletionChunk;
 import io.github.ankitnehra6.llmgateway.api.dto.ChatCompletionRequest;
+import io.github.ankitnehra6.llmgateway.api.dto.ChatCompletionResponse;
 import io.github.ankitnehra6.llmgateway.budget.BudgetService;
 import io.github.ankitnehra6.llmgateway.budget.UsageRecord;
 import io.github.ankitnehra6.llmgateway.cache.CachedCompletion;
@@ -15,6 +16,7 @@ import io.github.ankitnehra6.llmgateway.routing.ProviderRouter;
 import io.github.ankitnehra6.llmgateway.routing.RoutedCompletion;
 import io.github.ankitnehra6.llmgateway.tenant.Tenant;
 import java.time.Duration;
+import java.util.List;
 import java.util.Locale;
 import java.util.Optional;
 import java.util.UUID;
@@ -130,7 +132,20 @@ public class ChatStreamService {
             Duration elapsed = Duration.ofNanos(System.nanoTime() - startedAt);
             CompletionResult result = routed.result();
 
-            emitter.send(SseEmitter.event().data(ChatCompletionChunk.done(responseId, model, "stop")));
+            emitter.send(
+                    SseEmitter.event()
+                            .data(
+                                    ChatCompletionChunk.done(
+                                            responseId,
+                                            model,
+                                            "stop",
+                                            new ChatCompletionResponse.GatewayInfo(
+                                                    result.providerName(),
+                                                    false,
+                                                    routed.failedOver(),
+                                                    List.of(),
+                                                    budgets.status(tenant).remaining(),
+                                                    null))));
             emitter.send(SseEmitter.event().data(DONE_SENTINEL));
 
             budgets.record(
@@ -173,7 +188,20 @@ public class ChatStreamService {
                     SseEmitter.event()
                             .data(ChatCompletionChunk.content(responseId, cached.model(), word + " ")));
         }
-        emitter.send(SseEmitter.event().data(ChatCompletionChunk.done(responseId, cached.model(), "stop")));
+        emitter.send(
+                SseEmitter.event()
+                        .data(
+                                ChatCompletionChunk.done(
+                                        responseId,
+                                        cached.model(),
+                                        "stop",
+                                        new ChatCompletionResponse.GatewayInfo(
+                                                cached.provider(),
+                                                true,
+                                                false,
+                                                List.of(),
+                                                budgets.status(tenant).remaining(),
+                                                cached.similarity()))));
         emitter.send(SseEmitter.event().data(DONE_SENTINEL));
 
         budgets.record(

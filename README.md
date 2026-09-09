@@ -23,6 +23,7 @@ On a workload of 200 requests drawn from 20 distinct prompts, the semantic cache
 ## Contents
 
 - [Architecture](#architecture)
+- [Console](#console)
 - [Quickstart](#quickstart)
 - [What it does](#what-it-does)
 - [Verified behaviour](#verified-behaviour)
@@ -85,7 +86,8 @@ make down
 
 | What | Where |
 |---|---|
-| Gateway | <http://localhost:8080> |
+| **Console** | **<http://localhost:8080>** |
+| API | <http://localhost:8080/v1/chat/completions> |
 | Health | <http://localhost:8080/actuator/health> |
 | Metrics | <http://localhost:8080/actuator/prometheus> |
 | Prometheus | <http://localhost:9091> |
@@ -121,6 +123,34 @@ route the request actually took is right there in the response rather than only 
 
 **Demo keys** (seeded by the first migration, for local use only): `demo-key-free`
 (5,000 tokens), `demo-key-pro` (500,000), `demo-key-internal` (10,000,000).
+
+---
+
+## Console
+
+A single-page console is served from the jar at `/` — no separate frontend build, no CDN,
+no privileged endpoint. It talks to the same public API any SDK would.
+
+![LLM Gateway console showing a streamed cache hit, cache statistics, provider circuit state and tenant budget](docs/images/console.png)
+
+Ask something, then ask it again: the second answer arrives with a **cache hit** badge and
+its similarity score, and the request log marks it `CACHED`. Switch identity in the header
+to watch a different tenant's budget, or drain the 5,000-token free tier and see the 429
+surface as a problem document.
+
+- **Playground** — streams token by token, with a live caret; badges report which provider
+  answered, whether it was cached, the similarity, chunk count and time to first token
+- **Semantic cache** — hit rate, tokens saved, and the configured threshold
+- **Providers** — the failover chain in order, with each circuit breaker's state
+- **Budget** — the selected tenant's spend against its limit
+
+`?q=your+prompt&run=1` prefills and sends on load, so a demo can be linked rather than
+described.
+
+A detail worth noting: SSE chunks carry no metadata in the OpenAI schema, so a streamed
+cache hit would be indistinguishable from a streamed upstream call. The gateway attaches
+its `gateway` block to the **terminating** chunk — clients that only understand the vendor
+schema ignore the extra field, and this console uses it to label the response honestly.
 
 ---
 

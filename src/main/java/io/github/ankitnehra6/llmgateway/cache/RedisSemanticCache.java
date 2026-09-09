@@ -164,8 +164,11 @@ public class RedisSemanticCache implements SemanticCache {
             Document hit = result.getDocuments().getFirst();
 
             // Redis reports COSINE as a distance in [0, 2]; similarity is 1 - distance.
+            // Clamped because float32 rounding in the stored vector can put an identical
+            // match a hair above 1.0, and a reported similarity of 1.0000001 invites the
+            // reader to distrust every other number on the page.
             double distance = Double.parseDouble(hit.getString(SCORE_ALIAS));
-            double similarity = 1.0 - distance;
+            double similarity = Math.clamp(1.0 - distance, -1.0, 1.0);
 
             if (similarity < similarityThreshold) {
                 return Optional.empty();

@@ -1,0 +1,140 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>LLM Gateway Console</title>
+  <link rel="stylesheet" href="style.css">
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🧠</text></svg>">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="brand">
+    <span class="brand-mark" aria-hidden="true"></span>
+    <div>
+      <h1>LLM Gateway</h1>
+      <p class="brand-sub">Semantic cache · failover · per-tenant budgets</p>
+    </div>
+  </div>
+
+  <div class="topbar-meta">
+    <label class="field-inline">
+      <span>Identity</span>
+      <select id="api-key">
+        <option value="demo-key-pro">demo-key-pro · 500k tokens</option>
+        <option value="demo-key-free">demo-key-free · 5k tokens</option>
+        <option value="demo-key-internal">demo-key-internal · 10M tokens</option>
+      </select>
+    </label>
+    <div class="status" id="status">
+      <span class="status-dot" aria-hidden="true"></span>
+      <span id="status-text">connecting</span>
+    </div>
+  </div>
+</header>
+
+<main>
+
+  <!-- Playground -->
+  <section class="card playground">
+    <div class="card-head">
+      <h2>Playground</h2>
+      <label class="toggle">
+        <input type="checkbox" id="stream-toggle" checked>
+        <span>stream</span>
+      </label>
+    </div>
+
+    <form id="ask-form">
+      <textarea id="prompt" rows="3" placeholder="Ask something, then ask it again — the second time should come from cache."></textarea>
+      <div class="ask-row">
+        <button type="submit" class="btn" id="send">Send</button>
+        <button type="button" class="btn btn-quiet" id="repeat" disabled>Ask again (should hit cache)</button>
+        <span class="ask-hint">⌘/Ctrl + Enter</span>
+      </div>
+    </form>
+
+    <div class="answer" id="answer" hidden>
+      <div class="answer-badges" id="badges"></div>
+      <div class="answer-text" id="answer-text"></div>
+    </div>
+  </section>
+
+  <div class="split">
+
+    <!-- Cache -->
+    <section class="card">
+      <div class="card-head">
+        <h2>Semantic cache</h2>
+        <span class="hint" id="threshold-hint">&mdash;</span>
+      </div>
+
+      <div class="stat-row">
+        <div class="stat">
+          <span class="stat-value" id="hit-rate">&mdash;</span>
+          <span class="stat-label">hit rate</span>
+        </div>
+        <div class="stat">
+          <span class="stat-value" id="tokens-saved">&mdash;</span>
+          <span class="stat-label">tokens saved</span>
+        </div>
+        <div class="stat">
+          <span class="stat-value stat-muted" id="hit-miss">&mdash;</span>
+          <span class="stat-label">hits / misses</span>
+        </div>
+      </div>
+
+      <div class="meter">
+        <div class="meter-fill" id="hit-bar"></div>
+      </div>
+
+      <p class="note" id="cache-note">
+        Cache hits cost nothing upstream, so they are deliberately not charged
+        against a tenant's budget.
+      </p>
+    </section>
+
+    <!-- Providers -->
+    <section class="card">
+      <div class="card-head">
+        <h2>Providers</h2>
+        <span class="hint">failover order</span>
+      </div>
+      <div class="provider-list" id="providers">
+        <p class="empty">Loading&hellip;</p>
+      </div>
+
+      <div class="budget">
+        <div class="budget-head">
+          <span class="budget-label">Budget &mdash; <strong id="tenant-id">&mdash;</strong></span>
+          <span class="budget-figure"><span id="budget-used">&mdash;</span> / <span id="budget-limit">&mdash;</span></span>
+        </div>
+        <div class="meter">
+          <div class="meter-fill meter-budget" id="budget-bar"></div>
+        </div>
+      </div>
+    </section>
+
+  </div>
+
+  <!-- History -->
+  <section class="card">
+    <div class="card-head">
+      <h2>Request log</h2>
+      <button class="link-btn" id="clear-log">clear</button>
+    </div>
+    <div class="log" id="log"><p class="empty">No requests yet.</p></div>
+  </section>
+
+  <footer class="foot">
+    <span>model <strong id="model">&mdash;</strong></span>
+    <span><a href="/actuator/prometheus" target="_blank" rel="noopener">metrics</a></span>
+    <span><a href="/actuator/health" target="_blank" rel="noopener">health</a></span>
+  </footer>
+
+</main>
+
+<script src="app.js"></script>
+</body>
+</html>
